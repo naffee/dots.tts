@@ -11,6 +11,11 @@ from urllib.request import urlretrieve
 import runpod
 import soundfile as sf
 
+from apps.gradio.service import (
+    DEFAULT_PROMPT_NONE,
+    discover_prompt_presets,
+    resolve_prompt_selection,
+)
 from dots_tts.runtime import DotsTtsRuntime
 from dots_tts.utils.logging import configure_logging
 from dots_tts.utils.util import seed_everything
@@ -29,6 +34,7 @@ DEFAULT_HF_CACHE = os.environ.get("HF_HOME") or os.environ.get(
 configure_logging()
 
 _RUNTIME_CACHE: dict[tuple[str, str, bool, int], DotsTtsRuntime] = {}
+_PROMPT_PRESETS = discover_prompt_presets()
 
 
 def _get_runtime(
@@ -90,12 +96,86 @@ def _decode_prompt_audio(prompt_audio: str | None) -> tuple[str | None, list[str
     return str(output_path), [temp_dir]
 
 
-def handler(job: dict) -> dict:
-    job_input = job.get("input") or {}
+def _resolve_prompt_inputs(job_input: dict) -> tuple[str | None, str | None, list[str]]:
+    preset_name = str(job_input.get("preset_name", "") or "").strip()
+    prompt_audio = job_input.get("prompt_audio")
+    prompt_text = job_input.get("prompt_text")
 
-    text = job_input.get("text")
+    if preset_name and preset_name != DEFAULT_PROMPT_NONE:
+        preset_audio_path, preset_prompt_text = resolve_prompt_selection(
+            preset_name,
+            _PROMPT_PRESETS,
+        )
+        if preset_audio_path is None:
+            available_presets = [preset.name for preset in _PROMPT_PRESETS]
+            raise ValueError(
+                f"Unknown preset_name={preset_name!r}. "
+                f"Available presets: {available_presets or '[]'}."
+            )
+        if not prompt_audio:
+            prompt_audio = preset_audio_path
+        if not prompt_text:
+            prompt_text = preset_prompt_text or None
+
+    prompt_audio_url = job_input.get("prompt_audio_url")
+    prompt_audio_base64 = job_input.get("prompt_audio_base64")
+    if prompt_audio is None:
+        prompt_audio = prompt_audio_url or prompt_audio_base64
+
+    prompt_audio_path, cleanup_dirs = _decode_prompt_audio(prompt_audio)
+    normalized_prompt_text = (prompt_text or "").strip() or None
+    return prompt_audio_path, normalized_prompt_text, cleanup_dirs
+
+
+def _extract_job_input(job: dict) -> dict:
+    if not isinstance(job, dict):
+        return {}
+
+    raw_input = job.get("input")
+    if isinstance(raw_input, dict):
+        return raw_input
+
+    if isinstance(raw_input, str):
+        return {"text": raw_input}
+
+    if isinstance(job.get("body"), dict):
+        return job["body"]
+
+    if isinstance(job.get("body"), str):
+        return {"text": job["body"]}
+
+    return job
+
+
+def _resolve_text(job_input: dict) -> str | None:
+    for key in ("text", "input", "prompt", "message"):
+        value = job_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def handler(job: dict) -> dict:
+    job_input = _extract_job_input(job)
+
+    text = _resolve_text(job_input)
     if not text:
-        raise ValueError("input.text is required.")
+        return {
+            "error": "Missing synthesis text.",
+            "expected_input": {
+                "text": "Hello from dots tts.",
+                "preset_name": "<optional preset name if prompt assets exist>",
+                "prompt_audio": "<optional local path, URL, or base64 audio>",
+                "prompt_text": "<optional transcript matching prompt_audio>",
+                "model_name_or_path": DEFAULT_MODEL,
+                "num_steps": 10,
+                "guidance_scale": 1.2,
+                "seed": 42,
+            },
+            "accepted_text_fields": ["input.text", "input.prompt", "input.message"],
+            "available_presets": [preset.name for preset in _PROMPT_PRESETS],
+            "received_keys": sorted(job_input.keys()),
+        }
 
     model_name_or_path = job_input.get("model_name_or_path", DEFAULT_MODEL)
     precision = job_input.get("precision", DEFAULT_PRECISION)
@@ -113,16 +193,17 @@ def handler(job: dict) -> dict:
     )
 
     prompt_audio_path = None
+    prompt_text = None
     cleanup_dirs: list[str] = []
     try:
-        prompt_audio_path, cleanup_dirs = _decode_prompt_audio(
-            job_input.get("prompt_audio")
+        prompt_audio_path, prompt_text, cleanup_dirs = _resolve_prompt_inputs(
+            job_input
         )
         seed_everything(seed)
         result = runtime.generate(
             text=text,
             prompt_audio_path=prompt_audio_path,
-            prompt_text=job_input.get("prompt_text"),
+            prompt_text=prompt_text,
             template_name=job_input.get("template_name"),
             language=job_input.get("language"),
             speaker_scale=float(job_input.get("speaker_scale", 1.5)),
@@ -163,6 +244,7 @@ def handler(job: dict) -> dict:
         "model_name_or_path": model_name_or_path,
         "precision": precision,
         "seed": seed,
+        "preset_name": str(job_input.get("preset_name", "") or "") or None,
         "profiling": result["profiling"],
     }
 
