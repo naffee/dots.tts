@@ -73,14 +73,20 @@ def _as_bool(value: object) -> bool:
 def _decode_prompt_audio(prompt_audio: str | None) -> tuple[str | None, list[str]]:
     if not prompt_audio:
         return None, []
-    if Path(prompt_audio).exists():
-        return prompt_audio, []
     if _looks_like_url(prompt_audio):
         temp_dir = tempfile.mkdtemp(prefix="dots-tts-prompt-")
         suffix = Path(urlparse(prompt_audio).path).suffix or ".wav"
         output_path = Path(temp_dir) / f"prompt_audio{suffix}"
         urlretrieve(prompt_audio, output_path)
         return str(output_path), [temp_dir]
+
+    # Avoid treating long base64 payloads as filesystem paths.
+    if len(prompt_audio) < 512:
+        try:
+            if Path(prompt_audio).exists():
+                return prompt_audio, []
+        except OSError:
+            pass
 
     try:
         payload = prompt_audio.split(",", 1)[-1]
